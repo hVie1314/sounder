@@ -3,6 +3,7 @@ package com.offline.audiobookplayer.ui.player
 import android.app.Application
 import android.content.ComponentName
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -22,6 +23,7 @@ import com.offline.audiobookplayer.data.model.UserSettings
 import com.offline.audiobookplayer.data.repository.AudiobookRepository
 import com.offline.audiobookplayer.data.repository.NewTrackInput
 import com.offline.audiobookplayer.player.AudioPlaybackService
+import com.offline.audiobookplayer.player.SeekCoalescer
 import com.offline.audiobookplayer.player.SleepTimerManager
 import com.offline.audiobookplayer.player.SleepTimerState
 import com.offline.audiobookplayer.ui.theme.AppThemeMode
@@ -39,6 +41,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 private data class LiveControllerSnapshot(
     val isConnected: Boolean = false,
@@ -74,6 +77,13 @@ class PlayerViewModel(
     private var tickerJob: Job? = null
     private var shouldStayConnected: Boolean = false
 
+    private var optimisticSeekTargetMs: Long? = null
+    private var optimisticSeekExpiryElapsedMs: Long = 0L
+
+    private val stepSeekCoalescer = SeekCoalescer(viewModelScope) { targetMs ->
+        dispatchSeekImmediate(targetMs)
+    }
+
     private val playerListener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             syncFromPlayer(player)
@@ -89,11 +99,12 @@ class PlayerViewModel(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            optimisticSeekTargetMs = null
             liveControllerState.update {
                 it.copy(
                     isPlaying = false,
                     isBuffering = false,
-                    errorMessage = error.localizedMessage ?: "Không thể phát tệp âm thanh này"
+                    errorMessage = formatPlaybackError(error)
                 )
             }
         }
@@ -183,6 +194,7 @@ class PlayerViewModel(
     }
 
     override fun onCleared() {
+        stepSeekCoalescer.cancel()
         disconnectController()
         super.onCleared()
     }
@@ -196,6 +208,10 @@ class PlayerViewModel(
             if (controller.mediaItemCount == 0) return@launch
 
             if (controller.playbackState == Player.STATE_IDLE) {
+                val savedPos = uiState.value.currentPositionMs.coerceAtLeast(0L)
+                if (savedPos > 0L) {
+                    controller.seekTo(savedPos)
+                }
                 controller.prepare()
             }
             if (controller.isPlaying) {
@@ -209,27 +225,96 @@ class PlayerViewModel(
         }
     }
 
+    /**
+     * Executes an immediate Jump-To or SeekBar release seek.
+     * Recovers cleanly even if the MediaController is still connecting or the player was IDLE/ERROR.
+     */
     fun seekToPosition(positionMs: Long) {
-        val controller = mediaController ?: return
-        val duration = controller.duration
-        val clamped = if (duration > 0L) {
-            positionMs.coerceIn(0L, duration)
+        stepSeekCoalescer.cancel()
+        val knownDuration = uiState.value.durationMs
+        val previewClamped = if (knownDuration > 0L) {
+            positionMs.coerceIn(0L, knownDuration)
         } else {
             positionMs.coerceAtLeast(0L)
         }
-        controller.seekTo(clamped)
-        liveControllerState.update { it.copy(currentPositionMs = clamped) }
+        setOptimisticSeek(previewClamped)
+
+        val directController = mediaController
+        if (directController != null &&
+            directController.mediaItemCount > 0 &&
+            directController.playbackState != Player.STATE_IDLE
+        ) {
+            val dur = directController.duration.takeIf { it > 0L } ?: knownDuration
+            val clamped = if (dur > 0L) positionMs.coerceIn(0L, dur) else positionMs.coerceAtLeast(0L)
+            setOptimisticSeek(clamped)
+            directController.seekTo(clamped)
+            return
+        }
+
+        viewModelScope.launch {
+            dispatchSeekImmediate(positionMs)
+        }
+    }
+
+    private fun dispatchSeekImmediate(positionMs: Long) {
+        val direct = mediaController
+        if (direct != null && direct.mediaItemCount > 0 && direct.playbackState != Player.STATE_IDLE) {
+            val dur = direct.duration.takeIf { it > 0L } ?: uiState.value.durationMs
+            val clamped = if (dur > 0L) positionMs.coerceIn(0L, dur) else positionMs.coerceAtLeast(0L)
+            setOptimisticSeek(clamped)
+            direct.seekTo(clamped)
+            return
+        }
+
+        viewModelScope.launch {
+            val controller = awaitController() ?: return@launch
+            if (controller.mediaItemCount == 0) {
+                reconcileControllerQueueWithDb(controller)
+            }
+            if (controller.mediaItemCount == 0) return@launch
+
+            val dur = controller.duration.takeIf { it > 0L } ?: uiState.value.durationMs
+            val clamped = if (dur > 0L) positionMs.coerceIn(0L, dur) else positionMs.coerceAtLeast(0L)
+            setOptimisticSeek(clamped)
+
+            if (controller.playbackState == Player.STATE_IDLE) {
+                controller.seekTo(clamped)
+                controller.prepare()
+            } else {
+                controller.seekTo(clamped)
+            }
+        }
     }
 
     fun seekByStep(forward: Boolean) {
-        val controller = mediaController ?: return
+        val controller = mediaController
         val stepMs = uiState.value.settings.seekStepSeconds * 1_000L
-        val current = controller.currentPosition.coerceAtLeast(0L)
+        val basePos = stepSeekCoalescer.latestRequestedMs.takeIf { it >= 0L }
+            ?: controller?.currentPosition?.takeIf { it >= 0L }
+            ?: uiState.value.currentPositionMs
         val delta = if (forward) stepMs else -stepMs
-        seekToPosition(current + delta)
+        val dur = controller?.duration?.takeIf { it > 0L } ?: uiState.value.durationMs
+        val rawTarget = (basePos + delta).coerceAtLeast(0L)
+        val clamped = if (dur > 0L) rawTarget.coerceAtMost(dur) else rawTarget
+
+        setOptimisticSeek(clamped)
+        stepSeekCoalescer.requestSeek(clamped)
+    }
+
+    private fun setOptimisticSeek(targetMs: Long) {
+        optimisticSeekTargetMs = targetMs
+        optimisticSeekExpiryElapsedMs = SystemClock.elapsedRealtime() + OPTIMISTIC_SEEK_LOCK_MS
+        liveControllerState.update {
+            it.copy(
+                currentPositionMs = targetMs,
+                errorMessage = null
+            )
+        }
     }
 
     fun seekToPreviousTrack() {
+        stepSeekCoalescer.cancel()
+        optimisticSeekTargetMs = null
         viewModelScope.launch {
             val controller = awaitController() ?: return@launch
             val prevIndex = controller.currentMediaItemIndex - 1
@@ -244,6 +329,8 @@ class PlayerViewModel(
     }
 
     fun seekToNextTrack() {
+        stepSeekCoalescer.cancel()
+        optimisticSeekTargetMs = null
         viewModelScope.launch {
             val controller = awaitController() ?: return@launch
             val nextIndex = controller.currentMediaItemIndex + 1
@@ -256,6 +343,8 @@ class PlayerViewModel(
     }
 
     fun selectTrackFromQueue(index: Int) {
+        stepSeekCoalescer.cancel()
+        optimisticSeekTargetMs = null
         viewModelScope.launch {
             val queue = uiState.value.queue
             val track = queue.getOrNull(index) ?: return@launch
@@ -371,6 +460,8 @@ class PlayerViewModel(
     }
 
     fun clearQueue() {
+        stepSeekCoalescer.cancel()
+        optimisticSeekTargetMs = null
         viewModelScope.launch {
             sleepTimerManager.cancel()
             mediaController?.let { controller ->
@@ -426,7 +517,7 @@ class PlayerViewModel(
                     statusMessage = if (enabled) {
                         "Đã bật tua chính xác VBR (khởi tạo lại bài nếu đang phát)"
                     } else {
-                        "Đã chuyển về tua CBR an toàn cho file >4 GB"
+                        "Đã chuyển về tua nhanh 64-bit an toàn cho file >4 GB"
                     }
                 )
             }
@@ -496,20 +587,44 @@ class PlayerViewModel(
         val rawDuration = player.duration
         val duration = if (rawDuration > 0L) rawDuration else 0L
         val rawPosition = player.currentPosition
-        val position = if (rawPosition >= 0L) rawPosition else 0L
+        val playerPosition = if (rawPosition >= 0L) rawPosition else 0L
+        val isBuffering = player.playbackState == Player.STATE_BUFFERING
+
+        val resolvedPosition = resolvePositionWithOptimisticLock(
+            playerPosition = playerPosition,
+            isBuffering = isBuffering,
+            playbackState = player.playbackState
+        )
 
         liveControllerState.update { prev ->
             prev.copy(
                 isConnected = true,
                 mediaItemCount = player.mediaItemCount,
                 isPlaying = player.isPlaying,
-                isBuffering = player.playbackState == Player.STATE_BUFFERING,
+                isBuffering = isBuffering,
                 currentMediaItemIndex = currentIdx,
-                currentPositionMs = position,
+                currentPositionMs = resolvedPosition,
                 durationMs = duration,
                 errorMessage = if (player.playerError != null) prev.errorMessage else null
             )
         }
+    }
+
+    private fun resolvePositionWithOptimisticLock(
+        playerPosition: Long,
+        isBuffering: Boolean,
+        playbackState: Int
+    ): Long {
+        val optimistic = optimisticSeekTargetMs ?: return playerPosition
+        val now = SystemClock.elapsedRealtime()
+        val caughtUp = abs(playerPosition - optimistic) <= 2_500L
+        val settled = !isBuffering && playbackState == Player.STATE_READY && caughtUp
+
+        if (settled || now >= optimisticSeekExpiryElapsedMs) {
+            optimisticSeekTargetMs = null
+            return playerPosition
+        }
+        return optimistic
     }
 
     private fun startPositionTicker() {
@@ -520,9 +635,15 @@ class PlayerViewModel(
                 if (!controller.isPlaying) break
                 val rawPos = controller.currentPosition
                 val rawDur = controller.duration
+                val isBuffering = controller.playbackState == Player.STATE_BUFFERING
+                val resolvedPos = if (rawPos >= 0L) {
+                    resolvePositionWithOptimisticLock(rawPos, isBuffering, controller.playbackState)
+                } else {
+                    optimisticSeekTargetMs ?: liveControllerState.value.currentPositionMs
+                }
                 liveControllerState.update { prev ->
                     prev.copy(
-                        currentPositionMs = if (rawPos >= 0L) rawPos else prev.currentPositionMs,
+                        currentPositionMs = resolvedPos,
                         durationMs = if (rawDur > 0L) rawDur else prev.durationMs
                     )
                 }
@@ -558,6 +679,7 @@ class PlayerViewModel(
 
         val activeTrack = queue.getOrNull(activeIndex)
         val positionMs = when {
+            optimisticSeekTargetMs != null -> optimisticSeekTargetMs!!
             live.isConnected && live.mediaItemCount > 0 && live.currentPositionMs > 0L -> live.currentPositionMs
             live.isConnected && live.mediaItemCount > 0 && live.isPlaying -> live.currentPositionMs
             activeTrack != null && activeTrack.lastPositionMs > 0L -> activeTrack.lastPositionMs
@@ -586,6 +708,12 @@ class PlayerViewModel(
             statusMessage = flags.statusMessage,
             errorMessage = live.errorMessage
         )
+    }
+
+    private fun formatPlaybackError(error: PlaybackException): String {
+        val cause = error.cause?.localizedMessage?.takeIf { it.isNotBlank() }
+        val base = error.localizedMessage ?: "Không thể phát tệp âm thanh này"
+        return if (cause != null && !base.contains(cause)) "$base ($cause)" else base
     }
 
     private fun toMediaItem(track: QueueTrackEntity): MediaItem {
@@ -623,5 +751,6 @@ class PlayerViewModel(
 
     private companion object {
         const val UI_POSITION_TICK_MS = 250L
+        const val OPTIMISTIC_SEEK_LOCK_MS = 1_500L
     }
 }

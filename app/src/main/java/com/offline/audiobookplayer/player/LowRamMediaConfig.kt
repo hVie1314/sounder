@@ -16,11 +16,13 @@ import com.google.common.util.concurrent.ListenableFuture
 
 @OptIn(UnstableApi::class)
 object LowRamMediaConfig {
+    // Tuned for instant Jump-To & Seek on 4 GB RAM devices:
+    // After a seek ExoPlayer only needs 500 ms of decoded audio (~8 KB) before playback resumes.
     const val MIN_BUFFER_MS = 15_000
     const val MAX_BUFFER_MS = 30_000
-    const val BUFFER_FOR_PLAYBACK_MS = 1_000
-    const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 2_000
-    const val TARGET_BUFFER_BYTES = 2 * 1024 * 1024 // ~2 MB cap for low-RAM devices
+    const val BUFFER_FOR_PLAYBACK_MS = 400
+    const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 500
+    const val TARGET_BUFFER_BYTES = 2 * 1024 * 1024 // ~2 MB strict cap for 4 GB RAM devices
 
     fun buildLowRamLoadControl(): DefaultLoadControl {
         return DefaultLoadControl.Builder()
@@ -37,21 +39,21 @@ object LowRamMediaConfig {
 }
 
 /**
- * Configures MP3 extraction for massive >4 GB files (8-10 GB):
- * - Default CBR seeking + disabled ID3 metadata avoids 32-bit Xing header overflows,
- *   prevents multi-gigabyte scans, and blocks embedded artwork OOMs.
- * - Optional VBR index seeking fallback can be toggled in Settings.
+ * Configures MP3 extraction for massive >4 GB / 150-hour files:
+ * - Default mode uses [FastLargeMp3Extractor]: zero-allocation ID3v2 skip, 64-bit Xing TOC scaling,
+ *   corrupt/concatenated Xing rejection, and O(1) multi-point bitrate calibration via [SafFdCache].
+ * - Optional VBR index seeking fallback is restricted to files < 256 MB so giant 150-hour MP3s
+ *   never trigger multi-gigabyte linear scans or OOMs even if the user enables the toggle.
  */
 @OptIn(UnstableApi::class)
-class AudiobookExtractorsFactory : ExtractorsFactory {
+class AudiobookExtractorsFactory(
+    private val fdCache: SafFdCache? = null
+) : ExtractorsFactory {
 
     @Volatile
     var useVbrIndexSeeking: Boolean = false
 
-    private val cbrFastFactory = DefaultExtractorsFactory().setMp3ExtractorFlags(
-        Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS or
-            Mp3Extractor.FLAG_DISABLE_ID3_METADATA
-    )
+    private val fallbackFactory = DefaultExtractorsFactory()
 
     private val vbrIndexFallbackFactory = DefaultExtractorsFactory().setMp3ExtractorFlags(
         Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING or
@@ -59,18 +61,29 @@ class AudiobookExtractorsFactory : ExtractorsFactory {
     )
 
     override fun createExtractors(): Array<Extractor> {
-        return activeFactory().createExtractors()
+        return createExtractors(Uri.EMPTY, emptyMap())
     }
 
     override fun createExtractors(
         uri: Uri,
         responseHeaders: Map<String, List<String>>
     ): Array<Extractor> {
-        return activeFactory().createExtractors(uri, responseHeaders)
+        val targetUri = uri.takeUnless { it == Uri.EMPTY }
+        if (useVbrIndexSeeking) {
+            val fileSize = targetUri?.let { fdCache?.acquire(it)?.fileSize } ?: -1L
+            if (fileSize in 1L until VBR_INDEX_MAX_SAFE_BYTES) {
+                return vbrIndexFallbackFactory.createExtractors(uri, responseHeaders)
+            }
+        }
+
+        val fastMp3 = FastLargeMp3Extractor(uri = targetUri, fdCache = fdCache)
+        val others = fallbackFactory.createExtractors(uri, responseHeaders)
+            .filterNot { it is Mp3Extractor }
+        return arrayOf(fastMp3, *others.toTypedArray())
     }
 
-    private fun activeFactory(): DefaultExtractorsFactory {
-        return if (useVbrIndexSeeking) vbrIndexFallbackFactory else cbrFastFactory
+    companion object {
+        private const val VBR_INDEX_MAX_SAFE_BYTES = 256L * 1024L * 1024L
     }
 }
 

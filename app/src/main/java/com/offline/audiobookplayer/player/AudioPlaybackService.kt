@@ -19,6 +19,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
@@ -52,14 +53,17 @@ class AudioPlaybackService : MediaSessionService() {
     private lateinit var settingsDataStore: SettingsDataStore
     private lateinit var sleepTimerManager: SleepTimerManager
 
+    private lateinit var safFdCache: SafFdCache
     private lateinit var extractorsFactory: AudiobookExtractorsFactory
     private lateinit var exoPlayer: ExoPlayer
     private lateinit var forwardingPlayer: DynamicSeekPlayer
+    private lateinit var seekWatchdog: SeekTimeoutWatchdog
     private var mediaSession: MediaSession? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var periodicSaveJob: Job? = null
     private var endOfTrackFadeJob: Job? = null
+    private var deferredPersistJob: Job? = null
 
     @Volatile
     private var isInitialSeekPending: Boolean = false
@@ -96,6 +100,7 @@ class AudioPlaybackService : MediaSessionService() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) {
                 hasPlayerError = false
+                seekWatchdog.cancel()
                 startPeriodicPersistence()
                 startEndOfTrackWatcher()
             } else {
@@ -122,6 +127,7 @@ class AudioPlaybackService : MediaSessionService() {
                 Player.STATE_READY -> {
                     isInitialSeekPending = false
                     hasPlayerError = false
+                    seekWatchdog.cancel()
                     val trackUri = exoPlayer.currentMediaItem?.mediaId ?: return
                     val index = exoPlayer.currentMediaItemIndex
                     val pos = exoPlayer.currentPosition
@@ -141,6 +147,7 @@ class AudioPlaybackService : MediaSessionService() {
 
                 Player.STATE_ENDED -> {
                     isInitialSeekPending = false
+                    seekWatchdog.cancel()
                     val trackUri = exoPlayer.currentMediaItem?.mediaId ?: return
                     val index = exoPlayer.currentMediaItemIndex
                     val dur = exoPlayer.duration
@@ -158,7 +165,10 @@ class AudioPlaybackService : MediaSessionService() {
                     }
                 }
 
-                Player.STATE_IDLE,
+                Player.STATE_IDLE -> {
+                    seekWatchdog.cancel()
+                }
+
                 Player.STATE_BUFFERING -> Unit
             }
         }
@@ -174,31 +184,28 @@ class AudioPlaybackService : MediaSessionService() {
                     val oldUri = oldPosition.mediaItem?.mediaId
                     val targetUri = newPosition.mediaItem?.mediaId ?: return
                     val targetIndex = newPosition.mediaItemIndex
-                    val targetPos = newPosition.positionMs
+                    val targetPos = newPosition.positionMs.coerceAtLeast(0L)
                     val isTrackSwitch = oldUri != null && oldUri != targetUri
                     val dur = if (!isTrackSwitch && exoPlayer.duration > 0L) exoPlayer.duration else 0L
-                    serviceScope.launch {
-                        if (isTrackSwitch) {
-                            persistPosition(
-                                trackUri = oldUri!!,
-                                queueIndex = oldPosition.mediaItemIndex,
-                                candidatePositionMs = oldPosition.positionMs,
-                                durationMs = 0L,
-                                reason = SaveReason.TRACK_SWITCH
-                            )
-                        }
-                        persistPosition(
-                            trackUri = targetUri,
-                            queueIndex = targetIndex,
-                            candidatePositionMs = targetPos,
-                            durationMs = dur,
-                            reason = SaveReason.USER_SEEK
-                        )
+
+                    if (exoPlayer.playbackState == Player.STATE_BUFFERING) {
+                        seekWatchdog.onSeekStarted(targetPos)
                     }
+
+                    deferPersistAfterSeek(
+                        oldUri = if (isTrackSwitch) oldUri else null,
+                        oldIndex = oldPosition.mediaItemIndex,
+                        oldPos = oldPosition.positionMs,
+                        targetUri = targetUri,
+                        targetIndex = targetIndex,
+                        targetPos = targetPos,
+                        dur = dur
+                    )
                 }
 
                 Player.DISCONTINUITY_REASON_AUTO_TRANSITION -> {
                     isInitialSeekPending = false
+                    seekWatchdog.cancel()
                     val oldUri = oldPosition.mediaItem?.mediaId
                     val newUri = newPosition.mediaItem?.mediaId
                     val newIndex = newPosition.mediaItemIndex
@@ -249,8 +256,10 @@ class AudioPlaybackService : MediaSessionService() {
 
         override fun onPlayerError(error: PlaybackException) {
             hasPlayerError = true
+            seekWatchdog.cancel()
             stopPeriodicPersistence()
             stopEndOfTrackWatcher()
+            exoPlayer.currentMediaItem?.localConfiguration?.uri?.let(safFdCache::evict)
         }
     }
 
@@ -288,7 +297,9 @@ class AudioPlaybackService : MediaSessionService() {
             }
         )
 
-        extractorsFactory = AudiobookExtractorsFactory()
+        safFdCache = SafFdCache(this)
+        extractorsFactory = AudiobookExtractorsFactory(fdCache = safFdCache)
+        val dataSourceFactory = SafBufferedDataSource.Factory(this, safFdCache)
 
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
@@ -297,14 +308,27 @@ class AudioPlaybackService : MediaSessionService() {
 
         exoPlayer = ExoPlayer.Builder(this)
             .setLoadControl(LowRamMediaConfig.buildLowRamLoadControl())
-            .setMediaSourceFactory(DefaultMediaSourceFactory(this, extractorsFactory))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory))
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_LOCAL)
             .build()
             .apply {
+                // Snap directly to nearest audio frame (~13 ms) without decoding discarded delta samples.
+                setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 addListener(playerListener)
             }
+
+        seekWatchdog = SeekTimeoutWatchdog(
+            scope = serviceScope,
+            player = exoPlayer,
+            onBeforeRetry = { uri ->
+                isInitialSeekPending = true
+                if (uri != null) {
+                    safFdCache.evict(uri)
+                }
+            }
+        )
 
         forwardingPlayer = DynamicSeekPlayer(
             player = exoPlayer,
@@ -312,17 +336,18 @@ class AudioPlaybackService : MediaSessionService() {
             onSeekCommitted = { trackUri, targetPos ->
                 if (trackUri != null) {
                     isInitialSeekPending = false
+                    seekWatchdog.onSeekStarted(targetPos)
                     val index = exoPlayer.currentMediaItemIndex
                     val dur = exoPlayer.duration
-                    serviceScope.launch {
-                        persistPosition(
-                            trackUri = trackUri,
-                            queueIndex = index,
-                            candidatePositionMs = targetPos,
-                            durationMs = dur,
-                            reason = SaveReason.USER_SEEK
-                        )
-                    }
+                    deferPersistAfterSeek(
+                        oldUri = null,
+                        oldIndex = 0,
+                        oldPos = 0L,
+                        targetUri = trackUri,
+                        targetIndex = index,
+                        targetPos = targetPos,
+                        dur = dur
+                    )
                 }
             }
         )
@@ -377,6 +402,9 @@ class AudioPlaybackService : MediaSessionService() {
     override fun onDestroy() {
         stopPeriodicPersistence()
         stopEndOfTrackWatcher()
+        deferredPersistJob?.cancel()
+
+        if (::seekWatchdog.isInitialized) seekWatchdog.cancel()
 
         if (::exoPlayer.isInitialized) {
             persistCurrentSnapshotBlocking(SaveReason.SERVICE_TEARDOWN)
@@ -398,6 +426,10 @@ class AudioPlaybackService : MediaSessionService() {
         if (::exoPlayer.isInitialized) {
             exoPlayer.removeListener(playerListener)
             exoPlayer.release()
+        }
+
+        if (::safFdCache.isInitialized) {
+            safFdCache.releaseAll()
         }
 
         serviceScope.cancel()
@@ -520,6 +552,37 @@ class AudioPlaybackService : MediaSessionService() {
         endOfTrackFadeJob = null
     }
 
+    private fun deferPersistAfterSeek(
+        oldUri: String?,
+        oldIndex: Int,
+        oldPos: Long,
+        targetUri: String,
+        targetIndex: Int,
+        targetPos: Long,
+        dur: Long
+    ) {
+        deferredPersistJob?.cancel()
+        deferredPersistJob = serviceScope.launch {
+            delay(DEFERRED_PERSIST_DELAY_MS)
+            if (oldUri != null) {
+                persistPosition(
+                    trackUri = oldUri,
+                    queueIndex = oldIndex,
+                    candidatePositionMs = oldPos,
+                    durationMs = 0L,
+                    reason = SaveReason.TRACK_SWITCH
+                )
+            }
+            persistPosition(
+                trackUri = targetUri,
+                queueIndex = targetIndex,
+                candidatePositionMs = targetPos,
+                durationMs = dur,
+                reason = SaveReason.USER_SEEK
+            )
+        }
+    }
+
     private suspend fun persistPosition(
         trackUri: String,
         queueIndex: Int,
@@ -566,19 +629,25 @@ class AudioPlaybackService : MediaSessionService() {
         val clampedTarget = if (duration > 0L) rawTarget.coerceAtMost(duration) else rawTarget
 
         isInitialSeekPending = false
-        exoPlayer.seekTo(clampedTarget)
+        if (exoPlayer.playbackState == Player.STATE_IDLE) {
+            exoPlayer.seekTo(clampedTarget)
+            exoPlayer.prepare()
+        } else {
+            exoPlayer.seekTo(clampedTarget)
+        }
+        seekWatchdog.onSeekStarted(clampedTarget)
 
         val trackUri = exoPlayer.currentMediaItem?.mediaId ?: return
         val index = exoPlayer.currentMediaItemIndex
-        serviceScope.launch {
-            persistPosition(
-                trackUri = trackUri,
-                queueIndex = index,
-                candidatePositionMs = clampedTarget,
-                durationMs = duration,
-                reason = SaveReason.USER_SEEK
-            )
-        }
+        deferPersistAfterSeek(
+            oldUri = null,
+            oldIndex = 0,
+            oldPos = 0L,
+            targetUri = trackUri,
+            targetIndex = index,
+            targetPos = clampedTarget,
+            dur = duration
+        )
     }
 
     private fun buildMediaButtonPreferences(seekStepSeconds: Int): List<CommandButton> {
@@ -675,5 +744,6 @@ class AudioPlaybackService : MediaSessionService() {
         private const val PERIODIC_SAVE_INTERVAL_MS = 5_000L
         private const val END_OF_TRACK_WATCH_INTERVAL_MS = 200L
         private const val SHUTDOWN_SAVE_TIMEOUT_MS = 1_500L
+        private const val DEFERRED_PERSIST_DELAY_MS = 300L
     }
 }

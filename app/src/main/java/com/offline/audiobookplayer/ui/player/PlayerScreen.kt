@@ -372,7 +372,7 @@ private fun ActivePlayerContent(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 64-bit safe interactive SeekBar
+            // 64-bit safe interactive SeekBar: local preview during drag, single seek on release
             Slider(
                 value = sliderFraction,
                 onValueChange = { fraction ->
