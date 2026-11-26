@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">TruyenCast</string>
+    <string name="playback_notification_channel_name">Phát sách nói</string>
+    <string name="action_rewind_seconds">Tua lùi %1$d giây</string>
+    <string name="action_forward_seconds">Tua tới %1$d giây</string>
+    <string name="action_previous_track">Bài trước</string>
+    <string name="action_next_track">Bài tiếp</string>
 </resources>
