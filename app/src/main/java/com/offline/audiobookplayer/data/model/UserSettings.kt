@@ -1,6 +1,7 @@
 package com.offline.audiobookplayer.data.model
 
 import com.offline.audiobookplayer.ui.theme.AppThemeMode
+import kotlin.math.roundToInt
 
 data class UserSettings(
     val playbackSpeed: Float = DEFAULT_SPEED,
@@ -24,7 +25,7 @@ data class UserSettings(
         const val MAX_AUTO_REWIND_SECONDS = 60
 
         fun clampSpeed(speed: Float): Float {
-            return ((speed * 10f).toInt() / 10f).coerceIn(MIN_SPEED, MAX_SPEED)
+            return ((speed * 10f).roundToInt() / 10f).coerceIn(MIN_SPEED, MAX_SPEED)
         }
     }
 }

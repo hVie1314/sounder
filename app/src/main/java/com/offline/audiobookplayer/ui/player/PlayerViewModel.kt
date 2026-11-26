@@ -42,6 +42,7 @@ import kotlinx.coroutines.launch
 
 private data class LiveControllerSnapshot(
     val isConnected: Boolean = false,
+    val mediaItemCount: Int = 0,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val currentMediaItemIndex: Int = 0,
@@ -477,8 +478,15 @@ class PlayerViewModel(
     private suspend fun reconcileControllerQueueWithDb(controller: MediaController) {
         val snapshot = repository.getRestoreSnapshot() ?: return
         if (controller.mediaItemCount == 0) {
+            val settings = settingsDataStore.getSnapshot()
+            val autoRewindMs = settings.autoRewindSeconds * 1_000L
+            val resumePositionMs = if (snapshot.startPositionMs > 0L) {
+                (snapshot.startPositionMs - autoRewindMs).coerceAtLeast(0L)
+            } else {
+                0L
+            }
             val items = snapshot.queue.map(::toMediaItem)
-            controller.setMediaItems(items, snapshot.activeQueueIndex, snapshot.startPositionMs)
+            controller.setMediaItems(items, snapshot.activeQueueIndex, resumePositionMs)
             controller.prepare()
         }
     }
@@ -493,6 +501,7 @@ class PlayerViewModel(
         liveControllerState.update { prev ->
             prev.copy(
                 isConnected = true,
+                mediaItemCount = player.mediaItemCount,
                 isPlaying = player.isPlaying,
                 isBuffering = player.playbackState == Player.STATE_BUFFERING,
                 currentMediaItemIndex = currentIdx,
@@ -538,7 +547,7 @@ class PlayerViewModel(
     ): PlayerUiState {
         val activeIndex = when {
             queue.isEmpty() -> 0
-            live.isConnected -> live.currentMediaItemIndex.coerceIn(0, queue.lastIndex)
+            live.isConnected && live.mediaItemCount > 0 -> live.currentMediaItemIndex.coerceIn(0, queue.lastIndex)
             persistedPlayback?.activeTrackUri != null -> {
                 queue.indexOfFirst { it.uri == persistedPlayback.activeTrackUri }
                     .takeIf { it >= 0 }
@@ -549,14 +558,14 @@ class PlayerViewModel(
 
         val activeTrack = queue.getOrNull(activeIndex)
         val positionMs = when {
-            live.isConnected && live.currentPositionMs > 0L -> live.currentPositionMs
-            live.isConnected && live.isPlaying -> live.currentPositionMs
+            live.isConnected && live.mediaItemCount > 0 && live.currentPositionMs > 0L -> live.currentPositionMs
+            live.isConnected && live.mediaItemCount > 0 && live.isPlaying -> live.currentPositionMs
             activeTrack != null && activeTrack.lastPositionMs > 0L -> activeTrack.lastPositionMs
             persistedPlayback?.activeTrackUri == activeTrack?.uri -> persistedPlayback?.positionMs ?: 0L
             else -> live.currentPositionMs
         }
         val durationMs = when {
-            live.isConnected && live.durationMs > 0L -> live.durationMs
+            live.isConnected && live.mediaItemCount > 0 && live.durationMs > 0L -> live.durationMs
             activeTrack != null && activeTrack.durationMs > 0L -> activeTrack.durationMs
             persistedPlayback?.activeTrackUri == activeTrack?.uri -> persistedPlayback?.durationMs ?: 0L
             else -> 0L
