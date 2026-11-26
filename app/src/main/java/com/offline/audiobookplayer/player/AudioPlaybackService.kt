@@ -171,11 +171,22 @@ class AudioPlaybackService : MediaSessionService() {
             when (reason) {
                 Player.DISCONTINUITY_REASON_SEEK -> {
                     isInitialSeekPending = false
+                    val oldUri = oldPosition.mediaItem?.mediaId
                     val targetUri = newPosition.mediaItem?.mediaId ?: return
                     val targetIndex = newPosition.mediaItemIndex
                     val targetPos = newPosition.positionMs
-                    val dur = exoPlayer.duration
+                    val isTrackSwitch = oldUri != null && oldUri != targetUri
+                    val dur = if (!isTrackSwitch && exoPlayer.duration > 0L) exoPlayer.duration else 0L
                     serviceScope.launch {
+                        if (isTrackSwitch) {
+                            persistPosition(
+                                trackUri = oldUri!!,
+                                queueIndex = oldPosition.mediaItemIndex,
+                                candidatePositionMs = oldPosition.positionMs,
+                                durationMs = 0L,
+                                reason = SaveReason.TRACK_SWITCH
+                            )
+                        }
                         persistPosition(
                             trackUri = targetUri,
                             queueIndex = targetIndex,
@@ -394,15 +405,39 @@ class AudioPlaybackService : MediaSessionService() {
     }
 
     private fun observeSettings() {
+        var previousSeekStep: Int? = null
+        var previousVbrMode: Boolean? = null
+
         serviceScope.launch {
             settingsDataStore.settingsFlow.collectLatest { settings ->
                 currentSeekStepSeconds = settings.seekStepSeconds
                 extractorsFactory.useVbrIndexSeeking = settings.vbrIndexSeekingEnabled
                 exoPlayer.playbackParameters = PlaybackParameters(settings.playbackSpeed, 1.0f)
                 forwardingPlayer.updateSeekIncrementMs(settings.seekStepSeconds * 1_000L)
-                mediaSession?.setMediaButtonPreferences(
-                    buildMediaButtonPreferences(settings.seekStepSeconds)
-                )
+
+                if (previousSeekStep != settings.seekStepSeconds) {
+                    mediaSession?.setMediaButtonPreferences(
+                        buildMediaButtonPreferences(settings.seekStepSeconds)
+                    )
+                    previousSeekStep = settings.seekStepSeconds
+                }
+
+                if (previousVbrMode != null &&
+                    previousVbrMode != settings.vbrIndexSeekingEnabled &&
+                    exoPlayer.mediaItemCount > 0
+                ) {
+                    val wasPlaying = exoPlayer.isPlaying
+                    val currentIndex = exoPlayer.currentMediaItemIndex.coerceAtLeast(0)
+                    val currentPos = exoPlayer.currentPosition.coerceAtLeast(0L)
+                    val items = (0 until exoPlayer.mediaItemCount).map { exoPlayer.getMediaItemAt(it) }
+                    isInitialSeekPending = currentPos > 0L
+                    exoPlayer.setMediaItems(items, currentIndex, currentPos)
+                    exoPlayer.prepare()
+                    if (wasPlaying) {
+                        exoPlayer.play()
+                    }
+                }
+                previousVbrMode = settings.vbrIndexSeekingEnabled
             }
         }
     }

@@ -6,6 +6,23 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
+val TimerDisplayLargeStyle = TextStyle(
+    fontFamily = FontFamily.Monospace,
+    fontWeight = FontWeight.SemiBold,
+    fontSize = 40.sp,
+    lineHeight = 46.sp,
+    letterSpacing = 0.5.sp,
+    fontFeatureSettings = "tnum"
+)
+
+val TimerLabelStyle = TextStyle(
+    fontFamily = FontFamily.Monospace,
+    fontWeight = FontWeight.Medium,
+    fontSize = 13.sp,
+    lineHeight = 18.sp,
+    fontFeatureSettings = "tnum"
+)
+
 val TruyenCastTypography = Typography(
     displaySmall = TextStyle(
         fontFamily = FontFamily.SansSerif,
